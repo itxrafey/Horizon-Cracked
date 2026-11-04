@@ -1,0 +1,4 @@
+flet[desktop]==0.28.3
+minecraft-launcher-lib==8.0
+PyInstaller>=6.10,<7
+requests>=2.31,<3
