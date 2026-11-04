@@ -14,14 +14,14 @@
 
 </div>
 
-## 📌 Disclaimer
+##  Disclaimer
 > **This project was created purely as a life-quality automation script to streamline and simplify the execution process for personal and educational purposes.**  
 > It is **NOT** intended to claim ownership, redistribute, or infringe upon the work, code, or intellectual property of the original Horizon developers.
 >  All rights to the original software, assets, and components belong strictly to their respective creators. 
 
 ---
 
-## 🛠️ Getting Started
+##  Getting Started
 
 ### Prerequisites
 
@@ -30,7 +30,7 @@
 
 ### Installation
 
-* Install zip from releases, unzip and launch launcher.exe with dog icon on it and follow the instructions.
+* Install zip from releases, unzip and launch Crackrizon.exe  and follow the instructions.
 
 https://github.com/horizon-rust/horizon - - original repository of Horizon dev
 If you want to use this please go to original horizon-rust repo and star it
