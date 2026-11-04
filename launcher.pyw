@@ -1,20 +1,36 @@
+
+import sys
+import os
+for _stream_name in ("stdout", "stderr"):
+    if getattr(sys, _stream_name) is None:
+        setattr(sys, _stream_name, open(os.devnull, "w", encoding="utf-8"))
+
 from collections.abc import Callable
 import hashlib
 import json
-import os
-import random
 import platform as platform_module
 from pathlib import Path
 import queue
+import re
 import subprocess
 import tarfile
 import threading
-import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
-import webbrowser
 import requests
 import minecraft_launcher_lib
-import sys
+
+try:
+    import flet as ft
+except ImportError:  
+    import tkinter as _tk
+    from tkinter import messagebox as _mb
+    _root = _tk.Tk()
+    _root.withdraw()
+    _mb.showerror(
+        "Crackrizon Launcher",
+        'Flet is not installed.\n\nRun this command and start the launcher again:\n\n'
+        '    pip install "flet==0.28.3"',
+    )
+    sys.exit(1)
 
 if getattr(sys, 'frozen', False):
     APP_ROOT = Path(sys.executable).resolve().parent
@@ -22,42 +38,49 @@ else:
     APP_ROOT = Path(__file__).resolve().parent
 
 HORIZON_DIR = APP_ROOT / "horizon-windows-x64"
+ASSETS_DIR = Path(getattr(sys, "_MEIPASS", APP_ROOT)) / "assets"
+APP_ICON_FILE = ASSETS_DIR / "app_icon.ico"
 
-COLORS = {
-    "background": "#0f111a",
-    "sidebar": "#141722",
-    "topbar": "#141722",
-    "surface": "#1b1f2e",
-    "surface_light": "#252b42",
-    "border": "#2e3654",
-    "text": "#f0f2f5",
-    "muted": "#949fb5",
-    "accent": "#7c5cff",
-    "accent_hover": "#9175ff",
-    "disabled": "#2d3247",
-    "ok": "#4ade80",
-    "warn": "#fbbf24",
-    "danger": "#f87171",
-}
+# ───────────────────────────── Design tokens ─────────────────────────────
+TAGLINE = "Horizon client"          
 
-FONT_FILE = APP_ROOT / "assets" / "pixel.ttf"
-PIXEL_FONT_FAMILY = "Silkscreen"
-_pixel_font = "Consolas"
+BG = "#08090E"                     
+SIDEBAR = "#0B0C12"                 
+PANEL = "#10121A"                   
+RAISED = "#171A25"                  
+LINE = "#1E2230"                  
+LINE_HI = "#2C3144"                 
+TEXT = "#EDEFF5"
+MUTED = "#8187A0"
+FAINT = "#555B73"
+ACCENT = "#8B6CFF"
+ACCENT_DEEP = "#5F42E8"
+ACCENT_SOFT = "#B7A6FF"
+DAWN = "#FFB46B"                    
+OK = "#5EE3A1"
+WARN = "#F5B85C"
+DANGER = "#FF7A85"
+
+TONES = {"ok": OK, "warn": WARN, "danger": DANGER, "accent": ACCENT_SOFT}
+
+CUSTOM_FONT_FILE = ASSETS_DIR / "Inter.ttf"          # необязательный шрифт
+FONT = "Inter" if CUSTOM_FONT_FILE.is_file() else "Segoe UI"
+MONO = "Consolas"
+
+HERO_H = 340
+GROUND_H = 60
+MAX_LOG_LINES = 2000
+
+W = ft.FontWeight
+EASE = ft.AnimationCurve.EASE_OUT_CUBIC
 
 
-def register_pixel_font():
-    global _pixel_font
-    if os.name == "nt" and FONT_FILE.is_file():
-        try:
-            import ctypes
-            if ctypes.windll.gdi32.AddFontResourceExW(str(FONT_FILE), 0x10, 0):
-                _pixel_font = PIXEL_FONT_FAMILY
-        except Exception:
-            pass
+def alpha(color: str, opacity: float) -> str:
+    return ft.Colors.with_opacity(opacity, color)
 
 
-def pixel(size, weight="bold"):
-    return (_pixel_font, size, weight)
+def center() -> ft.Alignment:
+    return ft.Alignment(0, 0)
 
 
 def minecraft_directory():
@@ -67,535 +90,918 @@ def minecraft_directory():
     return Path.home() / "AppData" / "Roaming" / ".minecraft"
 
 
-class RoundedButton(tk.Canvas):
-    def __init__(self, parent, text, command, bg_color=COLORS["accent"], fg_color="#ffffff",
-                 hover_color=COLORS["accent_hover"], font=("Segoe UI", 10, "bold"), padx=20, pady=10):
-        approx_width = max(90, len(text) * 10 + padx * 2)
-        approx_height = 30 + pady * 2
+def launcher_config_directory():
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        return Path(appdata) / "Crackrizon"
+    return Path.home() / "AppData" / "Roaming" / "Crackrizon"
 
-        super().__init__(parent, bg=parent.cget("bg"), highlightthickness=0, cursor="hand2",
-                         width=approx_width, height=approx_height)
-        self.text = text
-        self.command = command
-        self.bg_color = bg_color
-        self.fg_color = fg_color
-        self.hover_color = hover_color
-        self.font = font
-        self.padx = padx
-        self.pady = pady
-        self._enabled = True
 
-        self.bind("<Configure>", self._draw)
-        self.bind("<Enter>", self._on_enter)
-        self.bind("<Leave>", self._on_leave)
-        self.bind("<Button-1>", self._on_click)
+def is_valid_offline_name(name):
+    return re.fullmatch(r"[A-Za-z0-9_]{1,16}", name) is not None
 
-    def _draw(self, event=None):
-        self.delete("all")
-        w = self.winfo_width()
-        h = self.winfo_height()
-        if w < 10 or h < 10:
-            return
 
-        current_bg = self.current_bg if hasattr(self, "current_bg") else self.bg_color
+# ───────────────────────────── UI components ─────────────────────────────
+class Btn(ft.Container):
+    """Кнопка в трёх вариантах: primary (светящаяся), secondary, ghost, danger."""
 
-        radius = 8
-        self.create_rounded_rect(2, 2, w - 2, h - 2, radius, fill=current_bg, outline="")
-        self.create_text(w / 2, h / 2, text=self.text, fill=self.fg_color, font=self.font)
+    SIZES = {
+        "sm": dict(h=36, px=16, fs=13, r=11, icon=16),
+        "md": dict(h=42, px=20, fs=13.5, r=13, icon=18),
+        "lg": dict(h=60, px=36, fs=16, r=18, icon=22),
+    }
 
-    def create_rounded_rect(self, x1, y1, x2, y2, r, **kwargs):
-        points = [
-            x1 + r, y1,
-            x2 - r, y1,
-            x2, y1,
-            x2, y1 + r,
-            x2, y2 - r,
-            x2, y2,
-            x2 - r, y2,
-            x1 + r, y2,
-            x1, y2,
-            x1, y2 - r,
-            x1, y1 + r,
-            x1, y1
-        ]
-        return self.create_polygon(points, smooth=True, **kwargs)
+    def __init__(self, label, on_click=None, *, icon=None, kind="secondary",
+                 size="md", tooltip=None):
+        super().__init__()
+        s = self.SIZES[size]
+        self._kind = kind
+        self._cb = on_click
+        self._on = True
+        self._hot = False
+        self._icon = ft.Icon(icon, size=s["icon"]) if icon else None
+        self._label = ft.Text(label, size=s["fs"], weight=W.W_600)
+        self.content = ft.Row(
+            [c for c in (self._icon, self._label) if c is not None],
+            spacing=10, tight=True, alignment=ft.MainAxisAlignment.CENTER,
+        )
+        self.height = s["h"]
+        self.padding = ft.padding.symmetric(horizontal=s["px"])
+        self.border_radius = s["r"]
+        self.alignment = center()
+        self.animate = ft.Animation(200, EASE)
+        self.animate_scale = ft.Animation(200, EASE)
+        self.tooltip = tooltip
+        self.on_click = self._clicked
+        self.on_hover = self._hovered
+        self._style()
 
-    def _on_enter(self, event):
-        if not self._enabled:
-            return
-        self.current_bg = self.hover_color
-        self._draw()
+    def _style(self):
+        kind, on, hot = self._kind, self._on, self._hot and self._on
+        bg, border, fg = None, None, TEXT
+        self.gradient = None
+        self.shadow = None
+        self.scale = 1
 
-    def _on_leave(self, event):
-        if not self._enabled:
-            return
-        self.current_bg = self.bg_color
-        self._draw()
+        if kind == "primary":
+            if on:
+                self.gradient = ft.LinearGradient(
+                    begin=ft.Alignment(-1, -1), end=ft.Alignment(1, 1),
+                    colors=["#A892FF" if hot else ACCENT, ACCENT_DEEP],
+                )
+                self.shadow = ft.BoxShadow(
+                    blur_radius=46 if hot else 30,
+                    color=alpha(ACCENT, 0.55 if hot else 0.35),
+                    offset=ft.Offset(0, 10),
+                )
+                self.scale = 1.03 if hot else 1
+                fg = "#FFFFFF"
+            else:
+                bg, fg = RAISED, FAINT
+        elif kind == "secondary":
+            if on:
+                bg = alpha("#FFFFFF", 0.08 if hot else 0.035)
+                border = alpha("#FFFFFF", 0.24 if hot else 0.10)
+            else:
+                border, fg = LINE, FAINT
+        elif kind == "ghost":
+            bg = alpha("#FFFFFF", 0.06) if hot else None
+            fg = TEXT if hot else (MUTED if on else FAINT)
+        elif kind == "danger":
+            if on:
+                fg = DANGER
+                bg = alpha(DANGER, 0.12) if hot else None
+                border = alpha(DANGER, 0.5 if hot else 0.28)
+            else:
+                border, fg = LINE, FAINT
 
-    def _on_click(self, event):
-        if self._enabled and self.command:
-            self.command()
+        self.bgcolor = bg
+        self.border = ft.border.all(1, border) if border else None
+        self._label.color = fg
+        if self._icon:
+            self._icon.color = fg
+        self.ink = on
 
+    def _clicked(self, _e):
+        if self._on and self._cb:
+            self._cb()
+
+    def _hovered(self, e):
+        self._hot = str(e.data).lower() == "true"
+        self._style()
+        try:
+            self.update()
+        except Exception:
+            pass
+
+    # Изменения без page.update(): его вызывает владелец (одним разом на пачку правок).
     def set_enabled(self, enabled: bool):
-        self._enabled = enabled
-        if enabled:
-            self.current_bg = self.bg_color
-            self.configure(cursor="hand2")
+        self._on = bool(enabled)
+        if not self._on:
+            self._hot = False
+        self._style()
+
+    def set_label(self, text: str):
+        self._label.value = text
+
+
+class NavItem(ft.Container):
+    def __init__(self, icon, tooltip, on_click):
+        super().__init__(
+            width=48, height=48, border_radius=15, alignment=center(),
+            tooltip=tooltip, ink=True, animate=ft.Animation(200, EASE),
+        )
+        self._icon = ft.Icon(icon, size=22)
+        self.content = self._icon
+        self._cb = on_click
+        self._active = False
+        self._hot = False
+        self.on_click = lambda _e: self._cb()
+        self.on_hover = self._hovered
+        self._style()
+
+    def _style(self):
+        if self._active:
+            self.bgcolor = alpha(ACCENT, 0.16)
+            self._icon.color = ACCENT_SOFT
+        elif self._hot:
+            self.bgcolor = alpha("#FFFFFF", 0.05)
+            self._icon.color = TEXT
         else:
-            self.current_bg = COLORS["disabled"]
-            self.configure(cursor="arrow")
-        self._draw()
+            self.bgcolor = None
+            self._icon.color = FAINT
 
-    def configure(self, cnf=None, **kwargs):
-        if cnf:
-            kwargs.update(cnf)
-        if "text" in kwargs:
-            self.text = kwargs.pop("text")
-        if "state" in kwargs:
-            state = kwargs.pop("state")
-            self.set_enabled(state != "disabled")
-        super().configure(**kwargs)
-        self._draw()
+    def _hovered(self, e):
+        self._hot = str(e.data).lower() == "true"
+        self._style()
+        try:
+            self.update()
+        except Exception:
+            pass
 
-    def config(self, cnf=None, **kwargs):
-        self.configure(cnf, **kwargs)
+    def set_active(self, active: bool):
+        self._active = active
+        self._style()
 
 
-HERO_H = 250
-PX = 10
+class WinButton(ft.Container):
+    def __init__(self, icon, on_click, danger=False):
+        super().__init__(
+            width=44, height=32, border_radius=9, alignment=center(),
+            ink=True, animate=ft.Animation(150, EASE),
+        )
+        self._danger = danger
+        self._icon = ft.Icon(icon, size=16, color=MUTED)
+        self.content = self._icon
+        self.on_click = lambda _e: on_click()
+        self.on_hover = self._hovered
+
+    def _hovered(self, e):
+        hot = str(e.data).lower() == "true"
+        if self._danger:
+            self.bgcolor = alpha(DANGER, 0.9) if hot else None
+            self._icon.color = "#FFFFFF" if hot else MUTED
+        else:
+            self.bgcolor = alpha("#FFFFFF", 0.07) if hot else None
+            self._icon.color = TEXT if hot else MUTED
+        try:
+            self.update()
+        except Exception:
+            pass
 
 
+def hairline():
+    return ft.Container(height=1, bgcolor=LINE)
+
+
+def make_field(**kwargs) -> ft.TextField:
+    options = dict(
+        text_size=14, color=TEXT, cursor_color=ACCENT,
+        filled=True, fill_color=alpha("#FFFFFF", 0.03),
+        border_radius=13, border_color=LINE_HI, focused_border_color=ACCENT,
+        border_width=1,
+        content_padding=ft.padding.symmetric(horizontal=18, vertical=15),
+        hint_style=ft.TextStyle(color=FAINT, size=14),
+    )
+    options.update(kwargs)
+    return ft.TextField(**options)
+
+
+# ───────────────────────────── Launcher ─────────────────────────────
 class HorizonLauncher:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("Crackrizon Launcher")
-        self.root.minsize(960, 640)
-        self.root.configure(bg=COLORS["background"])
-        self._center(1100, 700)
-
+    def __init__(self, page: ft.Page):
+        self.page = page
         self.events = queue.Queue()
         self.busy = False
-        self.minecraft_var = tk.StringVar(value=str(minecraft_directory()))
-        self.server_var = tk.StringVar()
-        self.status_var = tk.StringVar(value="")
-        self._hero_job = None
-        self._hero_art_w = 0
+        self.offline_profiles_file = launcher_config_directory() / "offline-profiles.json"
         self.current_page = None
+        self._log_buffer = []
+
+        self._configure_page()
 
         try:
             self.lock = json.loads((HORIZON_DIR / "research-lock.json").read_text(encoding="utf-8"))
             self.version = self.lock["minecraft"]["version"]
             self.java_major = self.lock["minecraft"]["java_major"]
         except (OSError, json.JSONDecodeError, KeyError, TypeError) as error:
-            messagebox.showerror(
-                "Horizon Load Error",
+            self._fatal(
+                "Horizon load error",
                 f"Could not find a valid research-lock.json in the Horizon folder.\n\n{error}",
-                parent=root,
             )
-            root.destroy()
             return
 
-        self.resources_dir = HORIZON_DIR / ".local" / "horizon-client" / self.version
-        bundled_server = HORIZON_DIR / ".local" / "minecraft" / self.version / "jars" / "server.jar"
-        if bundled_server.is_file():
-            self.server_var.set(str(bundled_server))
+        try:
+            if self.offline_profiles_file.exists():
+                profile_data = json.loads(self.offline_profiles_file.read_text(encoding="utf-8"))
+                profiles = profile_data["profiles"]
+                selected_profile = profile_data["selected"]
+                if (
+                    not isinstance(profiles, list)
+                    or not profiles
+                    or any(not isinstance(name, str) or not is_valid_offline_name(name) for name in profiles)
+                    or len({name.casefold() for name in profiles}) != len(profiles)
+                    or selected_profile not in profiles
+                ):
+                    raise ValueError("Offline profile settings have an invalid format.")
+                self.offline_profiles = profiles
+            else:
+                self.offline_profiles = ["Player"]
+                selected_profile = "Player"
+        except (OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
+            self._fatal("Profile load error", f"Could not load offline profiles.\n\n{error}")
+            return
 
-        self._setup_styles()
-        self._build_interface()
+        self.selected_profile = selected_profile
+        self.resources_dir = HORIZON_DIR / ".local" / "horizon-client" / self.version
+
+        self._build_ui()
         self._show_page("home")
         self._refresh_state()
         if self._is_prepared():
             self._set_status("Ready to play", "ok")
         else:
-            self._set_status("Click 'Prepare' to automatically download and set up the game", "warn")
-        self.root.after(100, self._poll_events)
+            self._set_status("Click Prepare to download and set up the game automatically", "warn")
+        self.page.update()
+        threading.Thread(target=self._event_loop, daemon=True).start()
 
-    def _center(self, width, height):
-        self.root.update_idletasks()
-        x = (self.root.winfo_screenwidth() - width) // 2
-        y = (self.root.winfo_screenheight() - height) // 3
-        self.root.geometry(f"{width}x{height}+{max(x, 0)}+{max(y, 0)}")
+    # ───────────── page / window ─────────────
+    def _configure_page(self):
+        page = self.page
+        page.title = "Crackrizon Launcher"
+        page.bgcolor = BG
+        page.padding = 0
+        page.spacing = 0
+        page.theme_mode = ft.ThemeMode.DARK
+        if CUSTOM_FONT_FILE.is_file():
+            page.fonts = {"Inter": "Inter.ttf"}
+        page.theme = self._make_theme()
+
+        win = page.window
+        win.width, win.height = 1120, 760
+        win.min_width, win.min_height = 980, 660
+        win.title_bar_hidden = True
+        win.title_bar_buttons_hidden = True
+        if APP_ICON_FILE.is_file():
+            win.icon = str(APP_ICON_FILE)
+        try:
+            win.center()
+        except Exception:
+            pass
 
     @staticmethod
-    def _setup_styles():
-        style = ttk.Style()
-        style.theme_use("clam")
-        style.configure(
-            "Horizon.Horizontal.TProgressbar",
-            troughcolor=COLORS["surface"],
-            background=COLORS["accent"],
-            bordercolor=COLORS["surface"],
-            lightcolor=COLORS["accent"],
-            darkcolor=COLORS["accent"],
-            thickness=3,
+    def _make_theme():
+        base = dict(font_family=FONT, use_material3=True, color_scheme_seed=ACCENT)
+        try:
+            return ft.Theme(
+                **base,
+                scrollbar_theme=ft.ScrollbarTheme(
+                    thickness=4, radius=8, thumb_color=alpha("#FFFFFF", 0.16),
+                ),
+                popup_menu_theme=ft.PopupMenuTheme(
+                    color=RAISED,
+                    shape=ft.RoundedRectangleBorder(radius=16),
+                    text_style=ft.TextStyle(color=TEXT, size=13.5),
+                ),
+            )
+        except (TypeError, AttributeError):
+            return ft.Theme(**base)
+
+    def _titlebar(self):
+        page = self.page
+
+        def minimize():
+            page.window.minimized = True
+            page.update()
+
+        def maximize():
+            page.window.maximized = not page.window.maximized
+            page.update()
+
+        def close():
+            page.window.close()
+
+        return ft.Row(
+            [
+                ft.WindowDragArea(content=ft.Container(height=44), expand=True),
+                ft.Container(
+                    padding=ft.padding.only(right=10),
+                    content=ft.Row(
+                        [
+                            WinButton(ft.Icons.MINIMIZE_ROUNDED, minimize),
+                            WinButton(ft.Icons.CROP_SQUARE_ROUNDED, maximize),
+                            WinButton(ft.Icons.CLOSE_ROUNDED, close, danger=True),
+                        ],
+                        spacing=2,
+                    ),
+                ),
+            ],
+            spacing=0,
         )
 
-    def _build_interface(self):
-        self._build_topbar()
-        tk.Frame(self.root, bg=COLORS["border"], height=1).pack(fill="x")
+    def _fatal(self, title, message):
+        page = self.page
+        page.controls.clear()
+        card = ft.Container(
+            width=520, padding=36, bgcolor=PANEL, border_radius=24,
+            border=ft.border.all(1, LINE),
+            content=ft.Column(
+                [
+                    ft.Icon(ft.Icons.ERROR_OUTLINE_ROUNDED, size=30, color=DANGER),
+                    ft.Text(title, size=22, weight=W.W_600, color=TEXT),
+                    ft.Text(message, size=13.5, color=MUTED, selectable=True),
+                    ft.Container(height=6),
+                    Btn("Close", lambda: page.window.close(), size="md"),
+                ],
+                spacing=12, tight=True,
+            ),
+        )
+        page.add(
+            ft.Column(
+                [self._titlebar(), ft.Container(expand=True, alignment=center(), content=card)],
+                spacing=0, expand=True,
+            )
+        )
+        page.update()
 
-        body = tk.Frame(self.root, bg=COLORS["background"])
-        body.pack(fill="both", expand=True)
-        self._build_sidebar(body)
-        tk.Frame(body, bg=COLORS["border"], width=1).pack(side="left", fill="y")
+    # ───────────── dialogs ─────────────
+    def _dialog(self, title, message, actions):
+        dlg = ft.AlertDialog(
+            modal=True, bgcolor=RAISED,
+            shape=ft.RoundedRectangleBorder(radius=22),
+            title=ft.Text(title, size=18, weight=W.W_600, color=TEXT),
+            content=ft.Container(width=440, content=ft.Text(message, size=13.5, color=MUTED, selectable=True)),
+            actions_alignment=ft.MainAxisAlignment.END,
+        )
+        dlg.actions = [
+            ft.TextButton(
+                text=label,
+                style=ft.ButtonStyle(color=color),
+                on_click=lambda _e, cb=callback: (self.page.close(dlg), cb() if cb else None),
+            )
+            for label, color, callback in actions
+        ]
+        self.page.open(dlg)
 
-        content = tk.Frame(body, bg=COLORS["background"])
-        content.pack(side="left", fill="both", expand=True)
-        self.pages = {
-            "home": self._build_home(content),
-            "settings": self._build_settings(content),
-            "log": self._build_log(content),
+    def _alert(self, title, message):
+        self._dialog(title, message, [("OK", ACCENT_SOFT, None)])
+
+    def _confirm(self, title, message, on_yes, yes_label="Confirm", danger=False):
+        self._dialog(title, message, [
+            ("Cancel", MUTED, None),
+            (yes_label, DANGER if danger else ACCENT_SOFT, on_yes),
+        ])
+
+    # ───────────── layout ─────────────
+    def _build_ui(self):
+        self.dir_picker = ft.FilePicker(on_result=self._on_directory_picked)
+        self.page.overlay.append(self.dir_picker)
+
+        self.nav = {
+            "home": NavItem(ft.Icons.HOME_ROUNDED, "Home", lambda: self._go("home")),
+            "settings": NavItem(ft.Icons.SETTINGS_ROUNDED, "Settings", lambda: self._go("settings")),
+            "log": NavItem(ft.Icons.TERMINAL_ROUNDED, "Log", lambda: self._go("log")),
         }
+        self.side_dot = ft.Container(
+            width=9, height=9, border_radius=5, bgcolor=WARN,
+            animate=ft.Animation(400, EASE),
+        )
+        logo = ft.Container(
+            width=42, height=42, border_radius=14, alignment=center(),
+            gradient=ft.LinearGradient(
+                begin=ft.Alignment(-1, -1), end=ft.Alignment(1, 1), colors=[ACCENT, DAWN],
+            ),
+            shadow=ft.BoxShadow(blur_radius=26, color=alpha(ACCENT, 0.35), offset=ft.Offset(0, 6)),
+            content=ft.Text("C", size=20, weight=W.W_700, color="#FFFFFF"),
+        )
+        sidebar = ft.Container(
+            width=78, bgcolor=SIDEBAR, padding=ft.padding.symmetric(vertical=24),
+            border=ft.border.only(right=ft.BorderSide(1, LINE)),
+            content=ft.Column(
+                [
+                    logo,
+                    ft.Container(height=22),
+                    *self.nav.values(),
+                    ft.Container(expand=True),
+                    self.side_dot,
+                    ft.Container(height=4),
+                ],
+                spacing=8, horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+            ),
+        )
+
+        self.pages = {
+            "home": self._build_home(),
+            "settings": self._build_settings(),
+            "log": self._build_log(),
+        }
+        self.host = ft.Container(expand=True)
         self.action_buttons = [
             self.play_button, self.prepare_button,
             self.sounds_button, self.download_libs_button,
         ]
 
-    def _build_topbar(self):
-        bar = tk.Frame(self.root, bg=COLORS["topbar"])
-        bar.pack(fill="x")
+        self.page.add(
+            ft.Row(
+                [
+                    sidebar,
+                    ft.Column([self._titlebar(), self.host], spacing=0, expand=True),
+                ],
+                spacing=0, expand=True, vertical_alignment=ft.CrossAxisAlignment.STRETCH,
+            )
+        )
 
-        brand = tk.Frame(bar, bg=COLORS["topbar"], padx=18)
-        brand.pack(side="left")
-        tk.Label(brand, text="■", font=("Segoe UI", 12), fg=COLORS["accent"],
-                 bg=COLORS["topbar"]).pack(side="left", padx=(0, 8))
-        tk.Label(brand, text="Horizon", font=pixel(12), fg=COLORS["text"],
-                 bg=COLORS["topbar"]).pack(side="left")
+    @staticmethod
+    def _page_shell(*controls, scroll=True):
+        return ft.Container(
+            expand=True,
+            padding=ft.padding.only(left=44, right=44, top=2, bottom=32),
+            content=ft.Column(
+                list(controls), spacing=0, expand=True,
+                scroll=ft.ScrollMode.AUTO if scroll else None,
+                horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
+            ),
+        )
 
-        self.tabs = {}
-        for key, title in (("home", "Home"), ("settings", "Settings"), ("log", "Log")):
-            self._make_tab(bar, key, title)
+    @staticmethod
+    def _heading(text):
+        return ft.Text(text, size=30, weight=W.W_300, color=TEXT,
+                       style=ft.TextStyle(letter_spacing=-0.8))
 
-    def _make_tab(self, parent, key, title):
-        holder = tk.Frame(parent, bg=COLORS["topbar"])
-        holder.pack(side="left", padx=(8, 0))
-        label = tk.Label(holder, text=title, font=("Segoe UI Semibold", 10),
-                         fg=COLORS["muted"], bg=COLORS["topbar"], padx=16, pady=15, cursor="hand2")
-        label.pack()
-        underline = tk.Frame(holder, bg=COLORS["topbar"], height=2)
-        underline.pack(fill="x")
-        label.bind("<Button-1>", lambda _e: self._show_page(key))
-        label.bind("<Enter>", lambda _e: label.configure(fg=COLORS["text"]))
-        label.bind("<Leave>", lambda _e: label.configure(
-            fg=COLORS["text"] if self.current_page == key else COLORS["muted"]))
-        self.tabs[key] = (label, underline)
+    # ───────────── home ─────────────
+    def _build_home(self):
+        # — hero —
+        self.play_button = Btn("Play", self._play, icon=ft.Icons.PLAY_ARROW_ROUNDED,
+                               kind="primary", size="lg")
+
+        self.profile_label = ft.Text(self.selected_profile, size=14.5, weight=W.W_600, color=TEXT)
+        self.profile_menu = ft.PopupMenuButton(
+            tooltip="Switch profile",
+            items=self._profile_menu_items(),
+            content=ft.Container(
+                height=60, padding=ft.padding.symmetric(horizontal=20), border_radius=18,
+                bgcolor=alpha("#FFFFFF", 0.05),
+                border=ft.border.all(1, alpha("#FFFFFF", 0.12)),
+                content=ft.Row(
+                    [
+                        ft.Icon(ft.Icons.PERSON_ROUNDED, size=20, color=ACCENT_SOFT),
+                        ft.Column(
+                            [ft.Text("Playing as", size=11, color=alpha("#FFFFFF", 0.45)),
+                             self.profile_label],
+                            spacing=0, tight=True,
+                        ),
+                        ft.Icon(ft.Icons.KEYBOARD_ARROW_DOWN_ROUNDED, size=18, color=MUTED),
+                    ],
+                    spacing=14, tight=True, vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                ),
+            ),
+        )
+
+        self.status_dot = ft.Container(
+            width=8, height=8, border_radius=4, bgcolor=WARN, animate=ft.Animation(300, EASE),
+        )
+        self.status_text = ft.Text("", size=13.5, color=TEXT, max_lines=1,
+                                   overflow=ft.TextOverflow.ELLIPSIS)
+        self.progress = ft.ProgressBar(
+            value=None, height=2, color=ACCENT_SOFT, bgcolor=ft.Colors.TRANSPARENT, visible=False,
+        )
+
+        def layer(**kwargs):
+            return ft.Container(left=0, right=0, top=0, bottom=0, **kwargs)
+
+        sun_glow = layer(gradient=ft.RadialGradient(
+            center=ft.Alignment(0.62, 0.62), radius=0.95,
+            colors=[alpha(DAWN, 0.50), alpha("#FF7A8A", 0.20), alpha(ACCENT, 0.08), ft.Colors.TRANSPARENT],
+            stops=[0.0, 0.34, 0.68, 1.0],
+        ))
+        violet_wash = layer(gradient=ft.RadialGradient(
+            center=ft.Alignment(-0.95, -0.2), radius=1.15,
+            colors=[alpha(ACCENT, 0.30), ft.Colors.TRANSPARENT],
+        ))
+        ground = ft.Container(
+            left=0, right=0, bottom=0, height=GROUND_H,
+            padding=ft.padding.symmetric(horizontal=44),
+            gradient=ft.LinearGradient(
+                begin=ft.Alignment(0, -1), end=ft.Alignment(0, 1),
+                colors=[alpha("#06070B", 0.78), alpha("#06070B", 0.96)],
+            ),
+            content=ft.Row(
+                [self.status_dot, ft.Container(content=self.status_text, expand=True)],
+                spacing=12, vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            ),
+        )
+        horizon_line = ft.Container(
+            left=0, right=0, bottom=GROUND_H, height=1,
+            gradient=ft.LinearGradient(
+                begin=ft.Alignment(-1, 0), end=ft.Alignment(1, 0),
+                colors=[ft.Colors.TRANSPARENT, alpha(ACCENT_SOFT, 0.35),
+                        alpha(DAWN, 0.85), alpha(ACCENT_SOFT, 0.25), ft.Colors.TRANSPARENT],
+                stops=[0.0, 0.25, 0.62, 0.85, 1.0],
+            ),
+        )
+        version_pill = ft.Container(
+            padding=ft.padding.symmetric(horizontal=14, vertical=7), border_radius=20,
+            bgcolor=alpha("#FFFFFF", 0.06), border=ft.border.all(1, alpha("#FFFFFF", 0.10)),
+            content=ft.Text(f"Minecraft {self.version}", size=12.5, weight=W.W_500,
+                            color=alpha("#FFFFFF", 0.75)),
+        )
+        hero_content = ft.Container(
+            left=0, right=0, top=0, bottom=GROUND_H,
+            padding=ft.padding.only(left=44, right=44, top=30, bottom=26),
+            content=ft.Column(
+                [
+                    ft.Column(
+                        [
+                            version_pill,
+                            ft.Container(height=14),
+                            ft.Text("Crackrizon", size=62, weight=W.W_200, color="#FFFFFF",
+                                    style=ft.TextStyle(letter_spacing=-2.5)),
+                            ft.Text(TAGLINE, size=15, color=alpha("#FFFFFF", 0.55)),
+                        ],
+                        spacing=0, tight=True,
+                    ),
+                    ft.Row([self.play_button, self.profile_menu], spacing=16,
+                           vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                ],
+                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+            ),
+        )
+        progress_layer = ft.Container(left=0, right=0, bottom=0, content=self.progress)
+
+        hero = ft.Container(
+            height=HERO_H, border_radius=26, clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
+            border=ft.border.all(1, LINE),
+            gradient=ft.LinearGradient(
+                begin=ft.Alignment(0, -1), end=ft.Alignment(0, 1),
+                colors=["#0D0E17", "#15112A"],
+            ),
+            content=ft.Stack(
+                [sun_glow, violet_wash, ground, horizon_line, hero_content, progress_layer],
+                expand=True,
+            ),
+        )
+
+        # — components list —
+        self.resources_desc = ft.Text("", size=13, color=MUTED)
+        self.prepare_button = Btn("Prepare", self._prepare, size="sm")
+        self.sounds_button = Btn("Add", self._prepare_sounds, size="sm")
+        self.download_libs_button = Btn("Download", self._download_all_libs, size="sm")
+
+        rows = ft.Column(
+            [
+                self._component_row(ft.Icons.LAYERS_ROUNDED, "Resources",
+                                    self.resources_desc, self.prepare_button),
+                hairline(),
+                self._component_row(
+                    ft.Icons.VOLUME_UP_ROUNDED, "Sounds",
+                    ft.Text("Copies sounds from the Minecraft folder (~380 MB). "
+                            "Available after preparing resources.", size=13, color=MUTED),
+                    self.sounds_button),
+                hairline(),
+                self._component_row(
+                    ft.Icons.EXTENSION_ROUNDED, "Libraries",
+                    ft.Text("Additional libraries: Vineflower, Jadx, and Java runtime.",
+                            size=13, color=MUTED),
+                    self.download_libs_button),
+            ],
+            spacing=0,
+        )
+        components = ft.Container(
+            bgcolor=PANEL, border_radius=22, border=ft.border.all(1, LINE),
+            padding=ft.padding.symmetric(vertical=6), content=rows,
+        )
+
+        return self._page_shell(
+            hero,
+            ft.Container(height=30),
+            ft.Text("Components", size=16, weight=W.W_600, color=TEXT),
+            ft.Container(height=12),
+            components,
+            ft.Container(height=14),
+            ft.Text(
+                f"Minecraft {self.version} and all components are downloaded automatically — "
+                "the official client is not required.",
+                size=12.5, color=FAINT,
+            ),
+        )
+
+    @staticmethod
+    def _component_row(icon, title, description, button):
+        tile = ft.Container(
+            width=44, height=44, border_radius=14, alignment=center(),
+            bgcolor=alpha("#FFFFFF", 0.04), border=ft.border.all(1, LINE),
+            content=ft.Icon(icon, size=21, color=ACCENT_SOFT),
+        )
+        return ft.Container(
+            padding=ft.padding.symmetric(horizontal=22, vertical=16),
+            content=ft.Row(
+                [
+                    tile,
+                    ft.Column(
+                        [ft.Text(title, size=14.5, weight=W.W_600, color=TEXT), description],
+                        spacing=3, expand=True,
+                    ),
+                    button,
+                ],
+                spacing=18, vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            ),
+        )
+
+    def _profile_menu_items(self):
+        items = [
+            ft.PopupMenuItem(
+                text=name,
+                icon=ft.Icons.CHECK_ROUNDED if name == self.selected_profile
+                else ft.Icons.PERSON_OUTLINE_ROUNDED,
+                on_click=lambda _e, n=name: self._select_offline_profile(n),
+            )
+            for name in self.offline_profiles
+        ]
+        items.append(ft.PopupMenuItem())
+        items.append(ft.PopupMenuItem(
+            text="Manage profiles", icon=ft.Icons.TUNE_ROUNDED,
+            on_click=lambda _e: self._go("settings"),
+        ))
+        return items
+
+    # ───────────── settings ─────────────
+    def _build_settings(self):
+        self.minecraft_field = make_field(value=str(minecraft_directory()), expand=True)
+        folder_panel = self._panel(
+            "Minecraft directory",
+            "Folder with the installed Minecraft and its game files.",
+            ft.Row(
+                [self.minecraft_field,
+                 Btn("Browse", self._choose_minecraft_directory,
+                     icon=ft.Icons.FOLDER_OPEN_ROUNDED, size="md")],
+                spacing=12, vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            ),
+        )
+
+        self.chips_row = ft.Row(wrap=True, spacing=10, run_spacing=10)
+        self.new_profile_field = make_field(
+            hint_text="New nickname", max_length=16, counter_text="", width=260,
+            on_submit=self._add_offline_profile, on_change=self._clear_profile_error,
+        )
+        self.remove_offline_profile_button = Btn(
+            "Remove", self._remove_offline_profile, kind="danger",
+            icon=ft.Icons.DELETE_OUTLINE_ROUNDED,
+        )
+        profile_panel = self._panel(
+            "Offline profiles",
+            "Player names for multiplayer servers in offline mode. "
+            "No Microsoft account is used. Click a profile to make it active.",
+            self.chips_row,
+            ft.Container(height=14),
+            hairline(),
+            ft.Container(height=18),
+            ft.Row(
+                [
+                    self.new_profile_field,
+                    Btn("Add profile", self._add_offline_profile,
+                        icon=ft.Icons.ADD_ROUNDED, size="md"),
+                    ft.Container(expand=True),
+                    self.remove_offline_profile_button,
+                ],
+                spacing=12, vertical_alignment=ft.CrossAxisAlignment.START,
+            ),
+        )
+        self._render_profiles()
+
+        return self._page_shell(
+            self._heading("Settings"),
+            ft.Container(height=22),
+            folder_panel,
+            ft.Container(height=18),
+            profile_panel,
+        )
+
+    @staticmethod
+    def _panel(title, subtitle, *body):
+        return ft.Container(
+            bgcolor=PANEL, border_radius=22, border=ft.border.all(1, LINE), padding=28,
+            content=ft.Column(
+                [
+                    ft.Text(title, size=16, weight=W.W_600, color=TEXT),
+                    ft.Text(subtitle, size=13, color=MUTED),
+                    ft.Container(height=10),
+                    *body,
+                ],
+                spacing=3,
+            ),
+        )
+
+    def _render_profiles(self):
+        chips = []
+        for name in self.offline_profiles:
+            selected = name == self.selected_profile
+            row = []
+            if selected:
+                row.append(ft.Icon(ft.Icons.CHECK_ROUNDED, size=16, color=ACCENT_SOFT))
+            row.append(ft.Text(name, size=13.5, weight=W.W_600 if selected else W.W_500,
+                               color=TEXT if selected else MUTED))
+            chips.append(ft.Container(
+                padding=ft.padding.symmetric(horizontal=18, vertical=11), border_radius=22,
+                bgcolor=alpha(ACCENT, 0.15) if selected else alpha("#FFFFFF", 0.03),
+                border=ft.border.all(1, alpha(ACCENT, 0.65) if selected else LINE_HI),
+                ink=True, on_click=lambda _e, n=name: self._select_offline_profile(n),
+                content=ft.Row(row, spacing=8, tight=True),
+            ))
+        self.chips_row.controls = chips
+        self.profile_label.value = self.selected_profile
+        self.profile_menu.items = self._profile_menu_items()
+        self.remove_offline_profile_button.set_label(f"Remove {self.selected_profile}")
+        self.remove_offline_profile_button.set_enabled(len(self.offline_profiles) > 1)
+
+    def _clear_profile_error(self, _e=None):
+        if self.new_profile_field.error_text:
+            self.new_profile_field.error_text = None
+            self.page.update()
+
+    def _write_offline_profiles(self, profiles, selected):
+        self.offline_profiles_file.parent.mkdir(parents=True, exist_ok=True)
+        temporary_file = self.offline_profiles_file.with_suffix(".tmp")
+        temporary_file.write_text(
+            json.dumps({"profiles": profiles, "selected": selected}, indent=2),
+            encoding="utf-8",
+        )
+        temporary_file.replace(self.offline_profiles_file)
+
+    def _select_offline_profile(self, name):
+        if name == self.selected_profile:
+            return
+        try:
+            self._write_offline_profiles(self.offline_profiles, name)
+        except OSError as error:
+            self._alert("Profile save error",
+                        f"Could not save the selected offline profile.\n\n{error}")
+            return
+        self.selected_profile = name
+        self._render_profiles()
+        self.page.update()
+
+    def _add_offline_profile(self, _e=None):
+        name = (self.new_profile_field.value or "").strip()
+        problem = None
+        if not is_valid_offline_name(name):
+            problem = "Use 1–16 ASCII letters, numbers or underscores."
+        elif any(existing.casefold() == name.casefold() for existing in self.offline_profiles):
+            problem = "A profile with that name already exists."
+        if problem:
+            self.new_profile_field.error_text = problem
+            self.page.update()
+            return
+
+        profiles = [*self.offline_profiles, name]
+        try:
+            self._write_offline_profiles(profiles, name)
+        except OSError as error:
+            self._alert("Profile save error", f"Could not save the new offline profile.\n\n{error}")
+            return
+        self.offline_profiles = profiles
+        self.selected_profile = name
+        self.new_profile_field.value = ""
+        self.new_profile_field.error_text = None
+        self._render_profiles()
+        self.page.update()
+
+    def _remove_offline_profile(self):
+        selected = self.selected_profile
+        if len(self.offline_profiles) <= 1:
+            return
+        self._confirm(
+            "Remove profile", f"Remove the profile “{selected}”?",
+            lambda: self._do_remove_profile(selected), yes_label="Remove", danger=True,
+        )
+
+    def _do_remove_profile(self, selected):
+        profiles = [name for name in self.offline_profiles if name != selected]
+        next_selected = profiles[0]
+        try:
+            self._write_offline_profiles(profiles, next_selected)
+        except OSError as error:
+            self._alert("Profile save error", f"Could not remove the offline profile.\n\n{error}")
+            return
+        self.offline_profiles = profiles
+        self.selected_profile = next_selected
+        self._render_profiles()
+        self.page.update()
+
+    def _choose_minecraft_directory(self):
+        self.dir_picker.get_directory_path(
+            dialog_title="Select Minecraft directory",
+            initial_directory=self.minecraft_field.value or str(Path.home()),
+        )
+
+    def _on_directory_picked(self, e):
+        if e.path:
+            self.minecraft_field.value = e.path
+            self.page.update()
+
+    # ───────────── log ─────────────
+    def _build_log(self):
+        self.log_view = ft.ListView(expand=True, spacing=3, auto_scroll=True)
+        self._append_log("Horizon Launcher is ready.")
+
+        header = ft.Row(
+            [
+                self._heading("Log"),
+                ft.Container(expand=True),
+                Btn("Copy", self._copy_log, icon=ft.Icons.CONTENT_COPY_ROUNDED,
+                    kind="ghost", size="sm"),
+                Btn("Clear", self._clear_log, icon=ft.Icons.DELETE_SWEEP_ROUNDED,
+                    kind="ghost", size="sm"),
+            ],
+            spacing=6, vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        )
+        panel = ft.Container(
+            expand=True, bgcolor="#090A0F", border_radius=22, border=ft.border.all(1, LINE),
+            padding=ft.padding.symmetric(horizontal=22, vertical=18),
+            content=self.log_view,
+        )
+        return self._page_shell(header, ft.Container(height=18), panel, scroll=False)
+
+    def _append_log(self, text, tag=None):
+        color = {"success": OK, "error": DANGER}.get(tag, MUTED)
+        self.log_view.controls.append(
+            ft.Text(text, size=12, color=color, font_family=MONO, selectable=True)
+        )
+        self._log_buffer.append(text)
+        overflow = len(self.log_view.controls) - MAX_LOG_LINES
+        if overflow > 0:
+            del self.log_view.controls[:overflow]
+            del self._log_buffer[:overflow]
+
+    def _copy_log(self):
+        self.page.set_clipboard("\n".join(self._log_buffer))
+        self.page.open(ft.SnackBar(
+            content=ft.Text("Log copied to clipboard", color=TEXT, size=13),
+            bgcolor=RAISED, duration=1800,
+        ))
+
+    def _clear_log(self):
+        self.log_view.controls.clear()
+        self._log_buffer.clear()
+        self.page.update()
+
+    # ───────────── navigation / state ─────────────
+    def _go(self, key):
+        self._show_page(key)
+        self.page.update()
 
     def _show_page(self, key):
         self.current_page = key
-        for name, page in self.pages.items():
-            page.pack_forget()
-        self.pages[key].pack(fill="both", expand=True)
-        for name, (label, underline) in self.tabs.items():
-            active = name == key
-            label.configure(fg=COLORS["text"] if active else COLORS["muted"])
-            underline.configure(bg=COLORS["accent"] if active else COLORS["topbar"])
-
-    def _build_sidebar(self, parent):
-        side = tk.Frame(parent, bg=COLORS["sidebar"], width=240, padx=14, pady=16)
-        side.pack(side="left", fill="y")
-        side.pack_propagate(False)
-
-        tk.Label(side, text="BUILD", font=("Segoe UI", 8, "bold"),
-                 fg=COLORS["muted"], bg=COLORS["sidebar"]).pack(anchor="w", pady=(0, 8))
-
-        build = tk.Frame(side, bg=COLORS["surface_light"])
-        build.pack(fill="x")
-        tk.Frame(build, bg=COLORS["accent"], width=3).pack(side="left", fill="y")
-        inner = tk.Frame(build, bg=COLORS["surface_light"], padx=10, pady=10)
-        inner.pack(side="left", fill="x", expand=True)
-
-        avatar = tk.Canvas(inner, width=42, height=42, bg=COLORS["sidebar"],
-                           highlightthickness=1, highlightbackground=COLORS["border"])
-        avatar.create_text(21, 21, text="H", font=pixel(16), fill=COLORS["text"])
-        avatar.pack(side="left")
-
-        texts = tk.Frame(inner, bg=COLORS["surface_light"])
-        texts.pack(side="left", padx=(10, 0))
-        tk.Label(texts, text="Horizon", font=pixel(11), fg=COLORS["text"],
-                 bg=COLORS["surface_light"]).pack(anchor="w")
-        state_row = tk.Frame(texts, bg=COLORS["surface_light"])
-        state_row.pack(anchor="w", pady=(2, 0))
-        self.side_dot = tk.Label(state_row, text="■", font=("Segoe UI", 7),
-                                 fg=COLORS["warn"], bg=COLORS["surface_light"])
-        self.side_dot.pack(side="left")
-        self.side_state = tk.Label(state_row, text="", font=("Segoe UI", 9),
-                                   fg=COLORS["muted"], bg=COLORS["surface_light"])
-        self.side_state.pack(side="left", padx=(5, 0))
-
-        hint = tk.Frame(side, bg=COLORS["surface"], highlightbackground=COLORS["border"],
-                        highlightthickness=1, padx=12, pady=10)
-        hint.pack(side="bottom", fill="x")
-        tk.Label(hint, text="Auto Setup", font=("Segoe UI Semibold", 9),
-                 fg=COLORS["text"], bg=COLORS["surface"]).pack(anchor="w")
-        tk.Label(
-            hint,
-            text=f"The launcher automatically downloads Minecraft {self.version} and components without the official client.",
-            font=("Segoe UI", 9), fg=COLORS["muted"], bg=COLORS["surface"],
-            justify="left", wraplength=188,
-        ).pack(anchor="w", pady=(4, 0))
-
-    def _build_home(self, parent):
-        page = tk.Frame(parent, bg=COLORS["background"])
-
-        self.hero = tk.Canvas(page, height=HERO_H, bg="#1b1433", highlightthickness=0)
-        self.hero.pack(fill="x")
-
-        c = self.hero
-        self.badge_bg = c.create_rectangle(0, 0, 0, 0, fill="#0e0c16", outline=COLORS["border"])
-        self.badge_marker = c.create_rectangle(0, 0, 0, 0, fill=COLORS["warn"], outline="")
-        self.badge_mc = c.create_text(0, 0, anchor="nw", fill=COLORS["text"],
-                                      font=("Segoe UI", 9, "bold"),
-                                      text=f"MINECRAFT {self.version}   ▪")
-        self.badge_state = c.create_text(0, 0, anchor="nw", fill=COLORS["warn"],
-                                         font=("Segoe UI", 9, "bold"), text="")
-        self.hero_title = c.create_text(0, 0, anchor="nw", text="Crackrizon",
-                                        font=pixel(40), fill="#ffffff")
-        self.hero_sub = c.create_text(0, 0, anchor="nw", text="bla bla bla pal laich.",
-                                      font=("Segoe UI", 12), fill="#d6cff2")
-        self.play_button = RoundedButton(
-            c, "▶   Play", self._play, bg_color=COLORS["accent"],
-            hover_color=COLORS["accent_hover"], font=("Segoe UI", 14, "bold"), padx=24, pady=8,
-        )
-        self.play_window = c.create_window(0, 0, window=self.play_button, anchor="se")
-        c.bind("<Configure>", self._on_hero_configure)
-
-        self.progress = ttk.Progressbar(page, mode="indeterminate",
-                                        style="Horizon.Horizontal.TProgressbar")
-        self.progress.pack(fill="x")
-
-        body = tk.Frame(page, bg=COLORS["background"], padx=28, pady=18)
-        body.pack(fill="both", expand=True)
-
-        self.status_label = tk.Label(
-            body, textvariable=self.status_var, font=("Segoe UI Semibold", 11),
-            fg=COLORS["ok"], bg=COLORS["background"], anchor="w",
-        )
-        self.status_label.pack(fill="x", pady=(0, 12))
-
-        _card, self.resources_desc = self._card(
-            body, "Resources", "",
-        )
-        self.prepare_button = RoundedButton(_card, "Prepare", self._prepare, padx=16, pady=6)
-        self.prepare_button.pack(side="right")
-
-        card, _ = self._card(
-            body, "Sounds",
-            "Copies sounds from the Minecraft folder (~380 MB). Available after preparing resources.",
-        )
-        self.sounds_button = RoundedButton(card, "Add", self._prepare_sounds, padx=16, pady=6)
-        self.sounds_button.pack(side="right")
-
-        card, _ = self._card(
-            body, "Libraries",
-            "Additional libraries: Vineflower, Jadx, and Java runtime.",
-        )
-        self.download_libs_button = RoundedButton(card, "Download", self._download_all_libs, padx=16, pady=6)
-        self.download_libs_button.pack(side="right")
-        return page
-
-    def _card(self, parent, title, description):
-        card = tk.Frame(parent, bg=COLORS["surface"], highlightbackground=COLORS["border"],
-                        highlightthickness=1, padx=20, pady=14)
-        card.pack(fill="x", pady=(0, 10))
-        left = tk.Frame(card, bg=COLORS["surface"])
-        left.pack(side="left", fill="x", expand=True)
-        tk.Label(left, text=title, font=pixel(11), fg=COLORS["text"],
-                 bg=COLORS["surface"]).pack(anchor="w")
-        desc = tk.Label(left, text=description, font=("Segoe UI", 10), fg=COLORS["muted"],
-                        bg=COLORS["surface"], justify="left", wraplength=520, anchor="w")
-        desc.pack(anchor="w", pady=(3, 0))
-        return card, desc
-
-    def _build_settings(self, parent):
-        page = tk.Frame(parent, bg=COLORS["background"], padx=28, pady=24)
-        tk.Label(page, text="Settings", font=pixel(16), fg=COLORS["text"],
-                 bg=COLORS["background"]).pack(anchor="w", pady=(0, 16))
-
-        self._path_card(
-            page, "Minecraft Directory",
-            "Catalog of installed Minecraft with game files.",
-            self.minecraft_var, self._choose_minecraft_directory,
-        )
-        return page
-
-    def _path_card(self, parent, title, hint, variable, browse):
-        card = tk.Frame(parent, bg=COLORS["surface"], highlightbackground=COLORS["border"],
-                        highlightthickness=1, padx=20, pady=16)
-        card.pack(fill="x", pady=(0, 10))
-        tk.Label(card, text=title, font=pixel(11), fg=COLORS["text"],
-                 bg=COLORS["surface"]).pack(anchor="w")
-        tk.Label(card, text=hint, font=("Segoe UI", 10), fg=COLORS["muted"],
-                 bg=COLORS["surface"]).pack(anchor="w", pady=(3, 10))
-        row = tk.Frame(card, bg=COLORS["surface"])
-        row.pack(fill="x")
-        entry = tk.Entry(
-            row, textvariable=variable, font=("Segoe UI", 10),
-            fg=COLORS["text"], bg=COLORS["background"], insertbackground=COLORS["text"],
-            relief="flat", highlightthickness=1,
-            highlightbackground=COLORS["border"], highlightcolor=COLORS["accent"],
-        )
-        entry.pack(side="left", fill="x", expand=True, ipady=8, padx=(0, 8))
-        RoundedButton(row, "Browse...", browse, padx=16, pady=6).pack(side="right")
-        return card
-
-    def _build_log(self, parent):
-        page = tk.Frame(parent, bg=COLORS["background"], padx=28, pady=24)
-        tk.Label(page, text="Log", font=pixel(16), fg=COLORS["text"],
-                 bg=COLORS["background"]).pack(anchor="w", pady=(0, 16))
-        panel = tk.Frame(page, bg=COLORS["surface"], highlightbackground=COLORS["border"],
-                         highlightthickness=1)
-        panel.pack(fill="both", expand=True)
-        self.log = tk.Text(
-            panel, bg=COLORS["surface"], fg=COLORS["muted"],
-            insertbackground=COLORS["text"], selectbackground=COLORS["border"],
-            relief="flat", wrap="word", font=("Consolas", 9), padx=14, pady=12,
-            state="disabled", borderwidth=0,
-        )
-        self.log.pack(fill="both", expand=True)
-        self.log.tag_configure("error", foreground=COLORS["danger"])
-        self.log.tag_configure("success", foreground=COLORS["ok"])
-        self._append_log("Horizon Launcher is ready.")
-        return page
-
-    def _on_hero_configure(self, _event):
-        if self._hero_job:
-            self.root.after_cancel(self._hero_job)
-        self._hero_job = self.root.after(20, self._redraw_hero)
-
-    def _redraw_hero(self):
-        self._hero_job = None
-        w = self.hero.winfo_width()
-        if w < 50:
-            return
-        if w != self._hero_art_w:
-            self.hero.delete("art")
-            self._draw_art(w)
-            self._hero_art_w = w
-        self._layout_hero(w)
-
-    def _draw_art(self, w):
-        c = self.hero
-        h = HERO_H
-        rows = h // PX
-        horizon = rows - 5
-        cols = w // PX + 1
-        sky = ["#1b1433", "#241a45", "#2f2058", "#42296a", "#5d3174",
-               "#7b3a79", "#9d477b", "#c25f7b", "#e5806f"]
-
-        def block(col, row, color):
-            c.create_rectangle(col * PX, row * PX, col * PX + PX, row * PX + PX,
-                               fill=color, outline="", tags="art")
-
-        prev = None
-        for r in range(horizon + 1):
-            color = sky[min(r * len(sky) // (horizon + 1), len(sky) - 1)]
-            if color != prev:
-                c.create_rectangle(0, r * PX, w, (horizon + 1) * PX, fill=color,
-                                   outline="", tags="art")
-                if prev is not None and r > 0:
-                    for col in range(0, cols, 2):
-                        block(col + (r % 2), r - 1, color)
-                prev = color
-
-        for cx, cy, widths in (
-                (0.14, 6, (3, 6, 4)), (0.52, 3, (4, 8, 5)), (0.90, 9, (3, 5, 3)),
-        ):
-            for i, wd in enumerate(widths):
-                start = int(cols * cx) - wd // 2
-                for k in range(wd):
-                    block(start + k, cy + i, "#7e4f90")
-
-        sun_col, sun_row, radius = int(cols * 0.8), horizon - 2, 5
-        for dx in range(-radius - 2, radius + 3):
-            for dy in range(-radius - 2, radius + 3):
-                d2 = dx * dx + dy * dy
-                row = sun_row + dy
-                if row > horizon:
-                    continue
-                if d2 <= radius * radius:
-                    block(sun_col + dx, row, "#f6b86c")
-                elif d2 <= (radius + 2) ** 2 and (dx + dy) % 2 == 0:
-                    block(sun_col + dx, row, "#d9707a")
-
-        rng = random.Random(3)
-        height = 2
-        for col in range(cols):
-            height = max(1, min(5, height + rng.choice((-1, 0, 0, 1))))
-            for k in range(height):
-                block(col, horizon - k, "#2c1b47")
-
-        c.create_rectangle(0, (horizon + 1) * PX - PX, w, h, fill="#150e27", outline="", tags="art")
-        height = 1
-        for col in range(cols):
-            height = max(0, min(2, height + rng.choice((-1, 0, 0, 1))))
-            for k in range(height):
-                block(col, horizon - k, "#150e27")
-
-        col = rng.randint(2, 6)
-        while col < cols:
-            for k in range(2):
-                block(col, horizon - k, "#0e0a1b")
-            for k, half in enumerate((0, 1, 2, 3)):
-                for dx in range(-half, half + 1):
-                    block(col + dx, horizon - 2 - (3 - k), "#0e0a1b")
-            col += rng.randint(8, 15)
-
-        c.tag_lower("art")
-
-    def _layout_hero(self, w):
-        c = self.hero
-        x0, y0, pad = 28, 34, 10
-        c.coords(self.badge_marker, x0 + pad, y0 + pad + 3, x0 + pad + 8, y0 + pad + 11)
-        c.coords(self.badge_mc, x0 + pad + 16, y0 + pad)
-        bx = c.bbox(self.badge_mc)
-        c.coords(self.badge_state, bx[2] + 10, y0 + pad)
-        bs = c.bbox(self.badge_state) or (bx[2], 0, bx[2], bx[3])
-        c.coords(self.badge_bg, x0, y0, bs[2] + pad, bs[3] + pad)
-        c.coords(self.hero_title, 28, 80)
-        c.coords(self.hero_sub, 31, 142)
-        c.coords(self.play_window, w - 28, HERO_H - 26)
+        self.host.content = self.pages[key]
+        for name, item in self.nav.items():
+            item.set_active(name == key)
 
     def _set_status(self, text, tone="ok"):
-        color = {
-            "ok": COLORS["ok"], "warn": COLORS["warn"],
-            "danger": COLORS["danger"], "accent": COLORS["accent_hover"],
-        }[tone]
-        self.status_var.set(text)
-        self.status_label.configure(fg=color)
+        color = TONES[tone]
+        self.status_text.value = text
+        self.status_text.color = color if tone in ("warn", "danger") else TEXT
+        self.status_dot.bgcolor = color
 
     def _refresh_state(self):
         prepared = self._is_prepared()
         if self.busy:
-            label, color = "Preparing...", COLORS["accent_hover"]
+            label, color = "Working…", ACCENT_SOFT
         elif prepared:
-            label, color = "Ready to play", COLORS["ok"]
+            label, color = "Ready to play", OK
         else:
-            label, color = "Preparation needed", COLORS["warn"]
+            label, color = "Preparation needed", WARN
 
-        self.side_state.configure(text=label)
-        self.side_dot.configure(fg=color)
-        self.hero.itemconfigure(self.badge_state, text=label.upper(), fill=color)
-        self.hero.itemconfigure(self.badge_marker, fill=color)
-        self.resources_desc.configure(
-            text="Prepared and ready to launch." if prepared
-            else "Click 'Prepare' to automatically download the game and resources."
+        self.side_dot.bgcolor = color
+        self.side_dot.tooltip = label
+        self.resources_desc.value = (
+            "Prepared and ready to launch." if prepared
+            else "Click Prepare to automatically download the game and resources."
         )
-        self.prepare_button.configure(text="Update" if prepared else "Prepare")
-        w = self.hero.winfo_width()
-        if w > 50:
-            self._layout_hero(w)
+        self.prepare_button.set_label("Update" if prepared else "Prepare")
+        self.play_button.set_label("Working…" if self.busy else ("Play" if prepared else "Install and play"))
+        self.progress.visible = self.busy
 
-    def _choose_minecraft_directory(self):
-        selected = filedialog.askdirectory(
-            title="Select Minecraft Directory",
-            initialdir=self.minecraft_var.get() or str(Path.home()),
-            parent=self.root,
-        )
-        if selected:
-            self.minecraft_var.set(selected)
-
+    # ───────────── backend (без изменений) ─────────────
     def _selected_paths(self):
-        minecraft_dir = Path(self.minecraft_var.get().strip()).expanduser()
+        minecraft_dir = Path(self.minecraft_field.value.strip()).expanduser()
         minecraft_dir.mkdir(parents=True, exist_ok=True)
         return minecraft_dir.resolve()
 
@@ -710,13 +1116,14 @@ class HorizonLauncher:
         return (self.resources_dir / "horizon-resources.json").is_file()
 
     def _play(self):
+        player_name = self.selected_profile
         if self._is_prepared():
-            self._start_task(self._launch_client)
+            self._start_task(lambda: self._launch_client(player_name))
             return
 
         minecraft_dir = self._selected_paths()
         self._start_task(
-            lambda: self._prepare_resources(minecraft_dir, launch=True)
+            lambda: self._prepare_resources(minecraft_dir, launch=True, player_name=player_name)
         )
 
     def _prepare(self):
@@ -727,11 +1134,7 @@ class HorizonLauncher:
 
     def _prepare_sounds(self):
         if not self._is_prepared():
-            messagebox.showwarning(
-                "Resources Not Prepared",
-                "Please click 'Play' or 'Prepare' first.",
-                parent=self.root,
-            )
+            self._alert("Resources not prepared", "Please click Play or Prepare first.")
             return
         minecraft_dir = self._selected_paths()
         self._start_task(lambda: self._copy_sounds(minecraft_dir))
@@ -744,7 +1147,7 @@ class HorizonLauncher:
             button.set_enabled(False)
         self._set_status("Preparing...", "accent")
         self._refresh_state()
-        self.progress.start(12)
+        self.page.update()
         threading.Thread(target=self._run_task, args=(task,), daemon=True).start()
 
     def _run_task(self, task):
@@ -804,7 +1207,8 @@ class HorizonLauncher:
                 raise RuntimeError(f"Failed to automatically download server.jar: {e}")
 
         return server_jar
-    def _prepare_resources(self, minecraft_dir, launch):
+
+    def _prepare_resources(self, minecraft_dir, launch, player_name=None):
         server_jar = self._ensure_minecraft_and_server(minecraft_dir)
 
         preparer = HORIZON_DIR / "horizon-prepare.exe"
@@ -824,7 +1228,7 @@ class HorizonLauncher:
         self.events.put(("status", "Resources prepared"))
         self.events.put(("log_success", "Preparation completed."))
         if launch:
-            self._launch_client()
+            self._launch_client(player_name)
 
     def _copy_sounds(self, minecraft_dir):
         preparer = HORIZON_DIR / "horizon-prepare.exe"
@@ -855,14 +1259,14 @@ class HorizonLauncher:
                 f"Preparation ended with code {return_code}. Check log for details."
             )
 
-    def _launch_client(self):
+    def _launch_client(self, player_name):
         client = HORIZON_DIR / "horizon-client.exe"
         if not client.is_file():
             raise RuntimeError(f"Horizon client not found: {client}")
         if not self._is_prepared():
             raise RuntimeError("Please prepare Horizon resources first.")
 
-        command = [str(client), "--resources", str(self.resources_dir)]
+        command = [str(client), "--resources", str(self.resources_dir), "--name", player_name]
         process = subprocess.Popen(
             command, cwd=HORIZON_DIR,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -882,51 +1286,57 @@ class HorizonLauncher:
         else:
             self.events.put(("status", "Game closed"))
 
-    def _append_log(self, text, tag=None):
-        self.log.configure(state="normal")
-        self.log.insert("end", text + "\n", tag)
-        self.log.see("end")
-        self.log.configure(state="disabled")
-
-    def _poll_events(self):
+    # ───────────── event pump ─────────────
+    def _event_loop(self):
+        """Забирает события из фоновых потоков и обновляет UI пачками."""
         while True:
             try:
-                event, value = self.events.get_nowait()
+                batch = [self.events.get(timeout=0.2)]
             except queue.Empty:
-                break
+                continue
+            while True:
+                try:
+                    batch.append(self.events.get_nowait())
+                except queue.Empty:
+                    break
 
-            if event == "log":
-                if value:
-                    self._append_log(value)
-            elif event == "log_success":
-                self._append_log(value, "success")
-            elif event == "status":
-                self._set_status(value, "ok")
-            elif event == "error":
-                self._set_status("Action failed", "danger")
-                self._append_log(value, "error")
-                self._show_page("log")
-                messagebox.showerror("Horizon Error", value, parent=self.root)
-            elif event == "client_error":
-                self._set_status(f"Game exited with code {value}", "danger")
-                self._append_log(f"Client finished with code {value}.", "error")
-                self._show_page("log")
-            elif event == "done":
-                self.busy = False
-                self.progress.stop()
-                for button in self.action_buttons:
-                    button.set_enabled(True)
-                self._refresh_state()
+            for event, value in batch:
+                try:
+                    self._handle_event(event, value)
+                except Exception as error:  
+                    self._append_log(f"UI error: {error}", "error")
+            try:
+                self.page.update()
+            except Exception:
+                pass
 
-        self.root.after(100, self._poll_events)
+    def _handle_event(self, event, value):
+        if event == "log":
+            if value:
+                self._append_log(value)
+        elif event == "log_success":
+            self._append_log(value, "success")
+        elif event == "status":
+            self._set_status(value, "ok")
+        elif event == "error":
+            self._set_status("Action failed", "danger")
+            self._append_log(value, "error")
+            self._show_page("log")
+            self._alert("Horizon error", value)
+        elif event == "client_error":
+            self._set_status(f"Game exited with code {value}", "danger")
+            self._append_log(f"Client finished with code {value}.", "error")
+            self._show_page("log")
+        elif event == "done":
+            self.busy = False
+            for button in self.action_buttons:
+                button.set_enabled(True)
+            self._refresh_state()
+
+
+def main(page: ft.Page):
+    HorizonLauncher(page)
 
 
 if __name__ == "__main__":
-    window = tk.Tk()
-
-    icon_path = APP_ROOT / "assets" / "icon.ico"
-    if icon_path.is_file():
-        window.iconbitmap(str(icon_path))
-
-    HorizonLauncher(window)
-    window.mainloop()
+    ft.app(target=main, assets_dir=str(ASSETS_DIR))
